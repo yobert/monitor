@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/PagerDuty/go-pagerduty"
 	"io/ioutil"
@@ -11,20 +12,15 @@ import (
 )
 
 type Service struct {
-	URL string `json:"url"`
-	Key string `json:"key"`
+	URL       string `json:"url"`
+	PagerDuty string `json:"pagerduty"`
+	Ntfy      string `json:"ntfy"`
 }
 
 func main() {
 	services, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	for _, service := range services {
-		if service.Key == "" || service.URL == "" {
-			log.Fatal("Service is missing key or url parameter")
-		}
 	}
 
 	for _, service := range services {
@@ -36,7 +32,8 @@ func main() {
 
 func watch(service Service) {
 	status := ""
-	incident := ""
+	pagerdutyincident := ""
+	ntfysh := false
 
 	for {
 		newstatus := ""
@@ -83,49 +80,74 @@ func watch(service Service) {
 			log.Println(service.URL, symbol, newstatus)
 		}
 
-		if bad && incident == "" {
-			event := pagerduty.Event{
-				Type:        "trigger",
-				ServiceKey:  service.Key,
-				Description: newstatus,
-			}
+		if service.Ntfy != "" {
+			if bad != ntfysh || (bad && status != newstatus) {
+				req, err := http.NewRequest("POST", "https://ntfy.sh/"+service.Ntfy, bytes.NewBufferString(newstatus))
+				if err != nil {
+					log.Println(err)
+					time.Sleep(time.Minute * 5)
+					continue
+				}
 
-			resp, err := pagerduty.CreateEvent(event)
-			if err != nil {
-				log.Println(err)
-				time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
-				continue
-			}
+				req.Header.Set("Title", service.URL)
 
-			incident = resp.IncidentKey
-		} else if !bad && incident != "" {
-			event := pagerduty.Event{
-				Type:        "resolve",
-				ServiceKey:  service.Key,
-				Description: newstatus,
-				IncidentKey: incident,
-			}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					log.Println(err)
+					time.Sleep(time.Minute * 5)
+					continue
+				}
+				resp.Body.Close()
 
-			if _, err := pagerduty.CreateEvent(event); err != nil {
-				log.Println(err)
-				time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
-				continue
+				ntfysh = bad
 			}
+		}
 
-			incident = ""
-		} else if bad {
-			// Update existing incident with new status (maybe error changed?)
-			event := pagerduty.Event{
-				Type:        "trigger",
-				ServiceKey:  service.Key,
-				Description: newstatus,
-				IncidentKey: incident,
-			}
+		if service.PagerDuty != "" {
+			if bad && pagerdutyincident == "" {
+				event := pagerduty.Event{
+					Type:        "trigger",
+					ServiceKey:  service.PagerDuty,
+					Description: newstatus,
+				}
 
-			if _, err := pagerduty.CreateEvent(event); err != nil {
-				log.Println(err)
-				time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
-				continue
+				resp, err := pagerduty.CreateEvent(event)
+				if err != nil {
+					log.Println(err)
+					time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
+					continue
+				}
+
+				pagerdutyincident = resp.IncidentKey
+			} else if !bad && pagerdutyincident != "" {
+				event := pagerduty.Event{
+					Type:        "resolve",
+					ServiceKey:  service.PagerDuty,
+					Description: newstatus,
+					IncidentKey: pagerdutyincident,
+				}
+
+				if _, err := pagerduty.CreateEvent(event); err != nil {
+					log.Println(err)
+					time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
+					continue
+				}
+
+				pagerdutyincident = ""
+			} else if bad && status != newstatus {
+				// Update existing incident with new status (maybe error changed?)
+				event := pagerduty.Event{
+					Type:        "trigger",
+					ServiceKey:  service.PagerDuty,
+					Description: newstatus,
+					IncidentKey: pagerdutyincident,
+				}
+
+				if _, err := pagerduty.CreateEvent(event); err != nil {
+					log.Println(err)
+					time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
+					continue
+				}
 			}
 		}
 
