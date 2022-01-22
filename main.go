@@ -57,6 +57,21 @@ func watch(service Service) {
 				} else {
 					txt = ct
 				}
+
+				if resp.TLS != nil {
+					for _, cert := range resp.TLS.PeerCertificates {
+						expires := cert.NotAfter.Sub(time.Now())
+						if expires < time.Hour*24*7*2 {
+							expires = expires.Truncate(time.Hour)
+							txt = fmt.Sprintf("Certificate %#v expires in ", cert.Subject.String())
+							if expires > time.Hour*24 {
+								txt += fmt.Sprintf("%.0f days", expires.Hours()/24)
+							} else {
+								txt += expires.Truncate(time.Hour * 24).String()
+							}
+						}
+					}
+				}
 			}
 
 			if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -77,7 +92,7 @@ func watch(service Service) {
 			if bad {
 				symbol = "✗"
 			}
-			log.Println(service.URL, symbol, newstatus)
+			log.Println(symbol, service.URL, newstatus)
 		}
 
 		if service.Ntfy != "" {
