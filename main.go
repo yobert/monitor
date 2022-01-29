@@ -15,6 +15,7 @@ type Service struct {
 	URL       string `json:"url"`
 	PagerDuty string `json:"pagerduty"`
 	Ntfy      string `json:"ntfy"`
+	Timeout   int    `json:"timeout"` // seconds
 }
 
 func main() {
@@ -35,11 +36,20 @@ func watch(service Service) {
 	pagerdutyincident := ""
 	ntfysh := false
 
+	timeout := service.Timeout
+	if timeout == 0 {
+		timeout = 10
+	}
+
+	client := http.Client{
+		Timeout: time.Duration(timeout) * time.Second,
+	}
+
 	for {
 		newstatus := ""
 		bad := false
 
-		resp, err := http.Get(service.URL)
+		resp, err := client.Get(service.URL)
 		if err != nil {
 			newstatus = err.Error()
 			bad = true
