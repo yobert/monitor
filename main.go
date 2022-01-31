@@ -70,19 +70,6 @@ func watch(service Service) {
 
 				if resp.TLS != nil {
 					for _, cert := range resp.TLS.PeerCertificates {
-						// I found the craziest bug.
-						// Heroku's SSL chain has an expired root. I think things just work
-						// because the OS chain contains something which has signed the intermediate.
-						// This confused the shit out of me because when you browse to some sites in firefox or chrome and
-						// look at the certificate chain, it shows something different for the issuer of the root.
-						//
-						// I guess just ignore this garbage for now?
-						// Maybe a better way would be to just check the leaf certificate? People seem to just use [0] but
-						// I'm not sure if it actually always has to be the first presented certificate. TODO
-						if cert.Issuer.CommonName == "AddTrust External CA Root" {
-							continue
-						}
-
 						expires := cert.NotAfter.Sub(time.Now())
 						if expires < time.Hour*24*7 {
 							bad = true
