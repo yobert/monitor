@@ -15,7 +15,18 @@ type Service struct {
 	URL       string `json:"url"`
 	PagerDuty string `json:"pagerduty"`
 	Ntfy      string `json:"ntfy"`
-	Timeout   int    `json:"timeout"` // seconds
+	Timeout   int    `json:"timeout"`  // timeout in seconds
+	Interval  int    `json:"interval"` // monitor interval in seconds
+
+	logged, status, pdstatus, ntfyshstatus Status
+
+	pdincident string
+	ntfysh     bool
+}
+
+type Status struct {
+	Message string
+	Bad     bool
 }
 
 func main() {
@@ -32,13 +43,15 @@ func main() {
 }
 
 func watch(service Service) {
-	status := ""
-	pagerdutyincident := ""
-	ntfysh := false
 
 	timeout := service.Timeout
 	if timeout == 0 {
 		timeout = 10
+	}
+
+	interval := service.Interval
+	if interval == 0 {
+		interval = 10
 	}
 
 	client := http.Client{
@@ -46,23 +59,22 @@ func watch(service Service) {
 	}
 
 	for {
-		newstatus := ""
-		bad := false
+		newstatus := Status{}
 
 		resp, err := client.Get(service.URL)
 		if err != nil {
-			newstatus = err.Error()
-			if strings.Contains(newstatus, "Timeout") {
-				newstatus = "Timeout"
+			newstatus.Message = err.Error()
+			if strings.Contains(newstatus.Message, "Timeout") {
+				newstatus.Message = fmt.Sprintf("Timed out after %v", client.Timeout)
 			}
-			bad = true
+			newstatus.Bad = true
 		} else {
 			txt := ""
 			body, err := ioutil.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if err != nil {
 				txt = err.Error()
-				bad = true
+				newstatus.Bad = true
 			} else {
 				ct := strings.ToLower(resp.Header.Get("Content-Type"))
 				if strings.HasPrefix(ct, "text/plain") && (!strings.Contains(ct, "encoding") || strings.Contains(ct, "utf8") || strings.Contains(ct, "utf-8")) {
@@ -75,7 +87,7 @@ func watch(service Service) {
 					for _, cert := range resp.TLS.PeerCertificates {
 						expires := cert.NotAfter.Sub(time.Now())
 						if expires < time.Hour*24*7 {
-							bad = true
+							newstatus.Bad = true
 							expires = expires.Truncate(time.Hour)
 							txt = fmt.Sprintf("Certificate %#v expires in ", cert.Subject.String())
 							if expires > time.Hour*24 {
@@ -87,9 +99,8 @@ func watch(service Service) {
 					}
 				}
 			}
-
 			if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				bad = true
+				newstatus.Bad = true
 			}
 
 			if txt == "" {
@@ -98,89 +109,109 @@ func watch(service Service) {
 			if len(txt) > 1024 {
 				txt = fmt.Sprintf("%s ... (trimmed %d bytes)", txt[:1024], len(txt)-1024)
 			}
-			newstatus = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, txt)
+			newstatus.Message = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, txt)
 		}
 
-		if newstatus != status {
+		if newstatus != service.logged {
 			symbol := "✓"
-			if bad {
+			if newstatus.Bad {
 				symbol = "✗"
 			}
-			log.Println(symbol, service.URL, newstatus)
+			log.Println(symbol, service.URL, newstatus.Message)
+			service.logged = newstatus
 		}
 
-		if service.Ntfy != "" {
-			if bad != ntfysh || (bad && status != newstatus) {
-				req, err := http.NewRequest("POST", "https://ntfy.sh/"+service.Ntfy, bytes.NewBufferString(newstatus))
-				if err != nil {
-					log.Println(err)
-					time.Sleep(time.Minute * 5)
-					continue
-				}
-
-				req.Header.Set("Title", service.URL)
-
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					log.Println(err)
-					time.Sleep(time.Minute * 5)
-					continue
-				}
-				resp.Body.Close()
-
-				ntfysh = bad
-			}
+		// Single debounce.
+		if newstatus != service.status {
+			service.status = newstatus
+		} else {
+			alertpagerduty(&service)
+			alertntfysh(&service)
 		}
 
-		if service.PagerDuty != "" {
-			if bad && pagerdutyincident == "" {
-				event := pagerduty.Event{
-					Type:        "trigger",
-					ServiceKey:  service.PagerDuty,
-					Description: newstatus,
-				}
-
-				resp, err := pagerduty.CreateEvent(event)
-				if err != nil {
-					log.Println(err)
-					time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
-					continue
-				}
-
-				pagerdutyincident = resp.IncidentKey
-			} else if !bad && pagerdutyincident != "" {
-				event := pagerduty.Event{
-					Type:        "resolve",
-					ServiceKey:  service.PagerDuty,
-					Description: newstatus,
-					IncidentKey: pagerdutyincident,
-				}
-
-				if _, err := pagerduty.CreateEvent(event); err != nil {
-					log.Println(err)
-					time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
-					continue
-				}
-
-				pagerdutyincident = ""
-			} else if bad && status != newstatus {
-				// Update existing incident with new status (maybe error changed?)
-				event := pagerduty.Event{
-					Type:        "trigger",
-					ServiceKey:  service.PagerDuty,
-					Description: newstatus,
-					IncidentKey: pagerdutyincident,
-				}
-
-				if _, err := pagerduty.CreateEvent(event); err != nil {
-					log.Println(err)
-					time.Sleep(time.Minute * 5) // If we can't log to pagerduty, just sleep for a few minutes and we'll try again.
-					continue
-				}
-			}
-		}
-
-		status = newstatus
-		time.Sleep(time.Second * 10)
+		time.Sleep(time.Duration(interval) * time.Second)
 	}
+}
+
+func alertntfysh(service *Service) {
+	if service.Ntfy == "" {
+		return
+	}
+
+	status := service.status
+	old := service.ntfyshstatus
+
+	if status == old {
+		return
+	}
+
+	if status.Bad == false && old.Bad == false {
+		// Ignore changes in only success status text
+		return
+	}
+
+	req, err := http.NewRequest("POST", "https://ntfy.sh/"+service.Ntfy, bytes.NewBufferString(status.Message))
+	if err != nil {
+		log.Println(err)
+		time.Sleep(time.Minute * 5)
+		return
+	}
+
+	req.Header.Set("Title", service.URL)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Println(err)
+		time.Sleep(time.Minute * 5)
+		return
+	}
+	resp.Body.Close()
+
+	service.ntfyshstatus = status
+}
+
+func alertpagerduty(service *Service) {
+	if service.PagerDuty == "" {
+		return
+	}
+
+	status := service.status
+	old := service.pdstatus
+	incident := service.pdincident
+
+	if status == old {
+		return
+	}
+
+	if status.Bad == false && old.Bad == false && incident == "" {
+		// Ignore changes in only success status text
+		return
+	}
+
+	event := pagerduty.Event{
+		Type:        "trigger",
+		ServiceKey:  service.PagerDuty,
+		Description: status.Message,
+		IncidentKey: incident,
+	}
+
+	if !status.Bad {
+		event.Type = "resolve"
+	}
+
+	resp, err := pagerduty.CreateEvent(event)
+	if err != nil {
+		log.Println(err)
+		time.Sleep(time.Minute * 5)
+		return
+	}
+
+	if status.Bad && incident == "" {
+		service.pdincident = resp.IncidentKey
+	}
+	if !status.Bad && incident != "" {
+		service.pdincident = ""
+	}
+	service.pdstatus = status
+	return
 }
