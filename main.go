@@ -52,6 +52,9 @@ func watch(service Service) {
 		resp, err := client.Get(service.URL)
 		if err != nil {
 			newstatus = err.Error()
+			if strings.Contains(newstatus, "Timeout") {
+				newstatus = "Timeout"
+			}
 			bad = true
 		} else {
 			txt := ""
