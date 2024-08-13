@@ -6,6 +6,7 @@ import (
 	"github.com/PagerDuty/go-pagerduty"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -42,6 +43,34 @@ func main() {
 	select {}
 }
 
+func makeClient(timeout time.Duration) *http.Client {
+	// Make a fresh transport so we don't cache connections for too long.
+	// Otherwise we get stale certificate timeouts if it reuses a connection
+	// for 90 days :)
+
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+
+	return client
+}
+
 func watch(service Service) {
 
 	timeout := service.Timeout
@@ -54,11 +83,15 @@ func watch(service Service) {
 		interval = 10
 	}
 
-	client := http.Client{
-		Timeout: time.Duration(timeout) * time.Second,
-	}
+	client := makeClient(time.Duration(timeout) * time.Second)
+	clientTime := time.Now()
 
 	for {
+		if time.Since(clientTime) > time.Hour {
+			client = makeClient(time.Duration(timeout) * time.Second)
+			clientTime = time.Now()
+		}
+
 		newstatus := Status{}
 
 		resp, err := client.Get(service.URL)
